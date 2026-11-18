@@ -1,0 +1,132 @@
+From 85b6586c48b281dc118bdbcf708dd3294fdd4338 Mon Sep 17 00:00:00 2001
+From: apchat-agent <dalienta@gmail.com>
+Date: Wed, 18 Nov 2026 22:36:01 +0100
+Subject: [PATCH] fib: add install notify for FIB entry forwarding changes
+
+Listeners registered with fib_entry_install_notify_register() are called
+when an entry's load-balance is first installed in the forwarding trie
+(ADD), modified in place (UPDATE), or removed (REMOVE). Used by the
+fibipfix plugin to export FIB programming events.
+
+Type: feature
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vnet/fib/fib_entry.h     | 23 ++++++++++++++++
+ src/vnet/fib/fib_entry_src.c | 52 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 75 insertions(+)
+
+diff --git a/src/vnet/fib/fib_entry.h b/src/vnet/fib/fib_entry.h
+index 7be22926d..7696e01bf 100644
+--- a/src/vnet/fib/fib_entry.h
++++ b/src/vnet/fib/fib_entry.h
+@@ -478,6 +478,29 @@ extern u32 fib_entry_get_stats_index(fib_node_index_t fib_entry_index);
+  * unsafe... beware the raw pointer.
+  */
+ extern fib_node_index_t fib_entry_get_index(const fib_entry_t * fib_entry);
++
++/**
++ * Events reported to install-notify listeners: an entry's forwarding has
++ * been programmed into the data-plane for the first time (ADD), modified
++ * in place (UPDATE), or removed from the forwarding trie (REMOVE).
++ */
++typedef enum fib_entry_install_event_t_
++{
++    FIB_ENTRY_INSTALL_EVENT_ADD,
++    FIB_ENTRY_INSTALL_EVENT_UPDATE,
++    FIB_ENTRY_INSTALL_EVENT_REMOVE,
++} fib_entry_install_event_t;
++
++/**
++ * Called on the main thread, with the workers held at the barrier, right
++ * after the forwarding change. The entry is still valid during a REMOVE.
++ * A listener must not modify the FIB from the callback.
++ */
++typedef void (*fib_entry_install_notify_fn_t)(fib_node_index_t fib_entry_index,
++                                              fib_entry_install_event_t event);
++
++extern void fib_entry_install_notify_register(fib_entry_install_notify_fn_t fn);
++extern void fib_entry_install_notify_unregister(fib_entry_install_notify_fn_t fn);
+ extern fib_entry_t * fib_entry_get(fib_node_index_t fib_entry_index);
+ 
+ /*
+diff --git a/src/vnet/fib/fib_entry_src.c b/src/vnet/fib/fib_entry_src.c
+index a61b75fa7..aaa659d26 100644
+--- a/src/vnet/fib/fib_entry_src.c
++++ b/src/vnet/fib/fib_entry_src.c
+@@ -681,6 +681,51 @@ fib_entry_src_mk_lb (fib_entry_t *fib_entry,
+     }
+ }
+ 
++/*
++ * Listeners told when an entry's forwarding is installed, updated or removed
++ */
++static fib_entry_install_notify_fn_t *fib_entry_install_notify_fns;
++
++void
++fib_entry_install_notify_register (fib_entry_install_notify_fn_t fn)
++{
++    u32 i;
++
++    vec_foreach_index (i, fib_entry_install_notify_fns)
++    {
++        if (fib_entry_install_notify_fns[i] == fn)
++            return;
++    }
++    vec_add1(fib_entry_install_notify_fns, fn);
++}
++
++void
++fib_entry_install_notify_unregister (fib_entry_install_notify_fn_t fn)
++{
++    u32 i;
++
++    vec_foreach_index (i, fib_entry_install_notify_fns)
++    {
++        if (fib_entry_install_notify_fns[i] == fn)
++        {
++            vec_del1(fib_entry_install_notify_fns, i);
++            return;
++        }
++    }
++}
++
++static void
++fib_entry_install_notify (const fib_entry_t *fib_entry,
++                          fib_entry_install_event_t event)
++{
++    fib_entry_install_notify_fn_t *fn;
++
++    vec_foreach (fn, fib_entry_install_notify_fns)
++    {
++        (*fn)(fib_entry_get_index(fib_entry), event);
++    }
++}
++
+ void
+ fib_entry_src_action_install (fib_entry_t *fib_entry,
+ 			      fib_source_t source)
+@@ -730,6 +775,11 @@ fib_entry_src_action_install (fib_entry_t *fib_entry,
+                             fib_entry_delegate_type_to_chain_type(fdt),
+                             &fed->fd_dpo);
+     });
++
++    fib_entry_install_notify(fib_entry,
++                             (insert ?
++                              FIB_ENTRY_INSTALL_EVENT_ADD :
++                              FIB_ENTRY_INSTALL_EVENT_UPDATE));
+ }
+ 
+ void
+@@ -749,6 +799,8 @@ fib_entry_src_action_uninstall (fib_entry_t *fib_entry)
+ 
+ 	vlib_worker_wait_one_loop();
+ 	dpo_reset(&fib_entry->fe_lb);
++
++	fib_entry_install_notify(fib_entry, FIB_ENTRY_INSTALL_EVENT_REMOVE);
+     }
+ }
+ 
+-- 
+2.55.0
+
