@@ -7,7 +7,7 @@ while its record is still in the packet being filled collapse into that one
 record, carrying the latest state and a count of the changes.
 
 Status: experimental. Built and tested against VPP master `edae1a0f6`
-(v26.10-rc0-556, 2026-09-23) on Ubuntu 24.04 arm64, debug build. The plugin's 8 tests
+(v26.10-rc0-556, 2026-09-23) on Ubuntu 24.04 arm64, debug build. The plugin's 9 tests
 pass (9). With the core patch applied, VPP's own test_fib, test_ip4, test_ip6, test_mpls, test_flowprobe and test_ipfix_export pass: 150 run, 144 passed, 6 skipped (non-extended run), plugin loaded but not enabled.
 
 ## What is here
