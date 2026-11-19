@@ -18,10 +18,12 @@
  *
  * The core FIB calls us (fib_entry_install_notify_register) when an entry's
  * forwarding is installed (ADD), modified in place (UPDATE) or removed
- * (REMOVE). Events are coalesced per entry until the next flush: an
- * ADD/UPDATE record only remembers the fib entry index, and the entry's
- * state is read when the record is sent, so many updates between two
- * flushes produce one record carrying the latest state and an event count.
+ * (REMOVE). Each event is written into the open IPFIX packet at once, with
+ * the entry's state at that moment. If the entry already has a record in
+ * that same open packet, the record is overwritten in place and its event
+ * count goes up: the coalescing window is the packet being filled. Once the
+ * packet is sent (full, or on the interval timer), the next event for the
+ * entry starts a new record in the next packet.
  *
  * Everything here runs on the main thread: FIB updates happen there with the
  * workers at the barrier, and the flush runs in a process node.
@@ -40,25 +42,21 @@
 
 typedef enum
 {
-  FIBIPFIX_EVENT_DEAD = 0, /* ADD then REMOVE before a flush: send nothing */
   FIBIPFIX_EVENT_ADD = 1,
   FIBIPFIX_EVENT_UPDATE = 2,
   FIBIPFIX_EVENT_REMOVE = 3,
   FIBIPFIX_EVENT_RESYNC = 4,
 } fibipfix_event_t;
 
+/* what one record says about an entry */
 typedef struct
 {
-  fib_node_index_t fei;
-  /* only filled for REMOVE: the entry is gone by the time we send */
-  fib_prefix_t prefix;
+  fib_prefix_t prefix; /* normalized */
   u32 table_id;
-  u32 n_events;
-  u64 last_ms;
-  u8 event;
-  /* the record is in pending_by_fei */
-  u8 hashed;
-} fibipfix_record_t;
+  ip46_address_t nh; /* first path */
+  u32 sw_if_index;
+  u16 n_paths;
+} fibipfix_state_t;
 
 /* report_elements: the high bit of info_element marks an enterprise IE */
 #define FIBIPFIX_ENTERPRISE_BIT 0x8000
@@ -122,17 +120,16 @@ typedef struct
   u8 enabled;
 
   /* config */
-  f64 interval;	  /* seconds between flushes */
-  u32 threshold;  /* pending records that trigger an early flush */
+  f64 interval;	  /* seconds between timer sends of the open packets */
   u32 enterprise; /* PEN of the enterprise IEs */
   u32 domain_id;
   u16 src_port;
 
-  /* pending records, in arrival order */
-  fibipfix_record_t *records;
-  uword *pending_by_fei;
-  u32 *fifo;
-  u8 flush_signalled;
+  /* per address family, for the open packet: which record slot each entry
+   * has (fei -> slot), and which entry each slot belongs to (~0 = a REMOVE,
+   * no longer keyed: the fib entry index can be reused) */
+  uword *slot_by_fei[2];
+  u32 *slot_fei[2];
 
   /* flow report bookkeeping */
   u16 template_id[FIBIPFIX_N_AF];
@@ -147,12 +144,13 @@ typedef struct
   /* counters */
   u64 n_events;
   u64 n_coalesced;
-  u64 n_records_sent;
+  u64 n_cancelled; /* ADD then REMOVE in the same open packet */
+  u64 n_records;
   u64 n_packets_sent;
   u64 n_dropped_no_collector;
   u64 n_dropped_no_buffer;
   u64 n_skipped_other_proto;
-  u64 n_flushes;
+  u64 n_timer_sends;
 } fibipfix_main_t;
 
 static fibipfix_main_t fibipfix_main;
@@ -310,72 +308,160 @@ fibipfix_find_report (ipfix_exporter_t *exp, fibipfix_af_t af)
   return 0;
 }
 
+/* offsets of the event type and event count inside a record */
+static const u32 fibipfix_event_offset[FIBIPFIX_N_AF] = {
+  4 + 4 + 1 + 4 + 4 + 8,
+  4 + 16 + 1 + 16 + 4 + 8,
+};
+
+/* the open packet of an address family is gone (sent, or freed by the
+ * exporter): forget which entries had a record in it */
 static void
-fibipfix_send (vlib_main_t *vm, ipfix_exporter_t *exp, flow_report_t *fr)
+fibipfix_packet_closed (fibipfix_af_t af)
+{
+  fibipfix_main_t *fm = &fibipfix_main;
+
+  hash_free (fm->slot_by_fei[af]);
+  fm->slot_by_fei[af] = hash_create (0, sizeof (uword));
+  vec_reset_length (fm->slot_fei[af]);
+}
+
+static void
+fibipfix_send (vlib_main_t *vm, ipfix_exporter_t *exp, flow_report_t *fr,
+	       fibipfix_af_t af)
 {
   fibipfix_main_t *fm = &fibipfix_main;
   flow_report_per_thread_t *ptd = &fr->per_thread_data[vm->thread_index];
   flow_report_stream_t *stream = &exp->streams[fr->stream_index];
 
-  if (!ptd->buffer)
-    return;
-  if (ptd->next_data_offset <= exp->all_headers_size)
-    return;
+  if (ptd->buffer && ptd->next_data_offset > exp->all_headers_size)
+    {
+      vnet_ipfix_exp_send_buffer (vm, exp, fr, stream, vm->thread_index,
+				  ptd->buffer);
+      /* send_buffer consumes n_data_records for the sequence number but
+       * does not reset it */
+      ptd->n_data_records = 0;
+      fm->n_packets_sent++;
+    }
+  fibipfix_packet_closed (af);
+}
 
-  vnet_ipfix_exp_send_buffer (vm, exp, fr, stream, vm->thread_index,
-			      ptd->buffer);
-  /* send_buffer consumes n_data_records for the sequence number but does
-   * not reset it */
-  ptd->n_data_records = 0;
-  fm->n_packets_sent++;
+/* read what a record says about the entry; -1 if it is not IP */
+static int
+fibipfix_read_state (fib_node_index_t fei, int with_paths,
+		     fibipfix_state_t *st)
+{
+  /* some entries (e.g. an interface's connected prefix) keep the host
+   * address with the prefix length; collectors expect the network */
+  fib_prefix_normalize (fib_entry_get_prefix (fei), &st->prefix);
+  st->table_id = fib_table_get_table_id (fib_entry_get_fib_index (fei),
+					 st->prefix.fp_proto);
+  clib_memset (&st->nh, 0, sizeof (st->nh));
+  st->sw_if_index = ~0;
+  st->n_paths = 0;
+
+  if (with_paths)
+    {
+      fib_route_path_t *paths = fib_entry_encode (fei);
+
+      st->n_paths = vec_len (paths);
+      if (st->n_paths)
+	st->nh = paths[0].frp_addr;
+      vec_free (paths);
+      st->sw_if_index = fib_entry_get_resolving_interface (fei);
+    }
+
+  if (st->prefix.fp_proto == FIB_PROTOCOL_IP4)
+    return FIBIPFIX_AF_IP4;
+  if (st->prefix.fp_proto == FIB_PROTOCOL_IP6)
+    return FIBIPFIX_AF_IP6;
+  return -1;
 }
 
 static void
-fibipfix_put_record (vlib_main_t *vm, ipfix_exporter_t *exp,
-		     fibipfix_record_t *r)
+fibipfix_write_record (u8 *d, fibipfix_af_t af, const fibipfix_state_t *st,
+		       u64 ms, u8 event, u32 n_events)
+{
+  clib_mem_unaligned (d, u32) = clib_host_to_net_u32 (st->table_id);
+  d += 4;
+  if (af == FIBIPFIX_AF_IP4)
+    {
+      clib_memcpy_fast (d, &st->prefix.fp_addr.ip4, 4);
+      d += 4;
+      *d++ = st->prefix.fp_len;
+      clib_memcpy_fast (d, &st->nh.ip4, 4);
+      d += 4;
+    }
+  else
+    {
+      clib_memcpy_fast (d, &st->prefix.fp_addr.ip6, 16);
+      d += 16;
+      *d++ = st->prefix.fp_len;
+      clib_memcpy_fast (d, &st->nh.ip6, 16);
+      d += 16;
+    }
+  clib_mem_unaligned (d, u32) = clib_host_to_net_u32 (st->sw_if_index);
+  d += 4;
+  clib_mem_unaligned (d, u64) = clib_host_to_net_u64 (ms);
+  d += 8;
+  *d++ = event;
+  clib_mem_unaligned (d, u32) = clib_host_to_net_u32 (n_events);
+  d += 4;
+  clib_mem_unaligned (d, u16) = clib_host_to_net_u16 (st->n_paths);
+}
+
+/* take a record out of the open packet: the last record moves into its slot */
+static void
+fibipfix_slot_delete (ipfix_exporter_t *exp, flow_report_t *fr,
+		      flow_report_per_thread_t *ptd, fibipfix_af_t af,
+		      u32 slot)
 {
   fibipfix_main_t *fm = &fibipfix_main;
-  const fib_prefix_t *pfx;
-  fib_prefix_t norm;
+  u32 rs = fr->data_record_size;
+  u32 last = vec_len (fm->slot_fei[af]) - 1;
+  u8 *base = (u8 *) vlib_buffer_get_current (ptd->buffer) +
+	     exp->all_headers_size;
+
+  if (slot != last)
+    {
+      u32 moved = fm->slot_fei[af][last];
+
+      clib_memcpy_fast (base + slot * rs, base + last * rs, rs);
+      fm->slot_fei[af][slot] = moved;
+      if (moved != ~0)
+	hash_set (fm->slot_by_fei[af], moved, slot);
+    }
+  vec_set_len (fm->slot_fei[af], last);
+  ptd->buffer->current_length -= rs;
+  ptd->next_data_offset -= rs;
+  ptd->n_data_records--;
+  fm->n_cancelled++;
+}
+
+static void
+fibipfix_event (vlib_main_t *vm, fib_node_index_t fei, u8 event)
+{
+  fibipfix_main_t *fm = &fibipfix_main;
+  ipfix_exporter_t *exp = fibipfix_exporter ();
   flow_report_per_thread_t *ptd;
+  fibipfix_state_t st;
   flow_report_t *fr;
-  fibipfix_af_t af;
   vlib_buffer_t *b;
-  ip46_address_t nh = { 0 };
-  u32 table_id, sw_if_index = ~0;
-  u16 n_paths = 0;
-  u8 *d;
+  u32 rs, slot, n_events;
+  u8 *d, old_event;
+  uword *p;
+  u64 now;
+  int af;
 
-  if (r->event == FIBIPFIX_EVENT_REMOVE)
+  if (!fibipfix_have_collector (exp))
     {
-      pfx = &r->prefix;
-      table_id = r->table_id;
-    }
-  else
-    {
-      fib_route_path_t *paths;
-
-      pfx = fib_entry_get_prefix (r->fei);
-      table_id = fib_table_get_table_id (fib_entry_get_fib_index (r->fei),
-					 pfx->fp_proto);
-      paths = fib_entry_encode (r->fei);
-      n_paths = vec_len (paths);
-      if (n_paths)
-	nh = paths[0].frp_addr;
-      vec_free (paths);
-      sw_if_index = fib_entry_get_resolving_interface (r->fei);
+      fm->n_dropped_no_collector++;
+      return;
     }
 
-  /* some entries (e.g. an interface's connected prefix) keep the host
-   * address with the prefix length; collectors expect the network */
-  fib_prefix_normalize (pfx, &norm);
-  pfx = &norm;
-
-  if (pfx->fp_proto == FIB_PROTOCOL_IP4)
-    af = FIBIPFIX_AF_IP4;
-  else if (pfx->fp_proto == FIB_PROTOCOL_IP6)
-    af = FIBIPFIX_AF_IP6;
-  else
+  /* a REMOVE has no paths any more; the prefix is still readable */
+  af = fibipfix_read_state (fei, event != FIBIPFIX_EVENT_REMOVE, &st);
+  if (af < 0)
     {
       fm->n_skipped_other_proto++;
       return;
@@ -385,12 +471,58 @@ fibipfix_put_record (vlib_main_t *vm, ipfix_exporter_t *exp,
   if (!fr)
     return;
   ptd = &fr->per_thread_data[vm->thread_index];
+  rs = fr->data_record_size;
+  now = fibipfix_now_ms (vm);
 
-  /* make room: MTU, and n_data_records is a u8 */
-  if (ptd->buffer &&
-      (ptd->next_data_offset + fr->data_record_size > exp->path_mtu ||
-       ptd->n_data_records == 255))
-    fibipfix_send (vm, exp, fr);
+  /* the exporter may have freed our open packet (reconfiguration) */
+  if (!ptd->buffer && vec_len (fm->slot_fei[af]))
+    fibipfix_packet_closed (af);
+
+  p = hash_get (fm->slot_by_fei[af], fei);
+  if (p)
+    {
+      /* the entry has a record in the open packet: overwrite it */
+      slot = p[0];
+      d = (u8 *) vlib_buffer_get_current (ptd->buffer) +
+	  exp->all_headers_size + slot * rs;
+      old_event = d[fibipfix_event_offset[af]];
+      n_events = clib_net_to_host_u32 (
+		   clib_mem_unaligned (d + fibipfix_event_offset[af] + 1, u32)) +
+		 1;
+      fm->n_coalesced++;
+
+      switch (event)
+	{
+	case FIBIPFIX_EVENT_REMOVE:
+	  hash_unset (fm->slot_by_fei[af], fei);
+	  fm->slot_fei[af][slot] = ~0;
+	  if (old_event == FIBIPFIX_EVENT_ADD)
+	    {
+	      /* the collector never saw it: send nothing */
+	      fibipfix_slot_delete (exp, fr, ptd, af, slot);
+	      return;
+	    }
+	  break;
+	case FIBIPFIX_EVENT_UPDATE:
+	  /* the collector has not seen the ADD yet */
+	  if (old_event == FIBIPFIX_EVENT_ADD)
+	    event = FIBIPFIX_EVENT_ADD;
+	  break;
+	case FIBIPFIX_EVENT_RESYNC:
+	  /* already in this packet with its latest state */
+	  fm->n_coalesced--;
+	  return;
+	default:
+	  break;
+	}
+      fibipfix_write_record (d, af, &st, now, event, n_events);
+      return;
+    }
+
+  /* a new record: make room first (MTU; n_data_records is a u8) */
+  if (ptd->buffer && (ptd->next_data_offset + rs > exp->path_mtu ||
+		      ptd->n_data_records == 255))
+    fibipfix_send (vm, exp, fr, af);
 
   b = vnet_ipfix_exp_get_buffer (vm, exp, fr, vm->thread_index);
   if (!b)
@@ -399,120 +531,39 @@ fibipfix_put_record (vlib_main_t *vm, ipfix_exporter_t *exp,
       return;
     }
 
-  d = vlib_buffer_get_current (b) + ptd->next_data_offset;
+  slot = vec_len (fm->slot_fei[af]);
+  ASSERT (ptd->next_data_offset == exp->all_headers_size + slot * rs);
+  d = (u8 *) vlib_buffer_get_current (b) + ptd->next_data_offset;
+  fibipfix_write_record (d, af, &st, now, event, 1);
+  b->current_length += rs;
+  ptd->next_data_offset += rs;
+  ptd->n_data_records++;
+  fm->n_records++;
 
-  clib_mem_unaligned (d, u32) = clib_host_to_net_u32 (table_id);
-  d += 4;
-  if (af == FIBIPFIX_AF_IP4)
-    {
-      clib_memcpy_fast (d, &pfx->fp_addr.ip4, 4);
-      d += 4;
-      *d++ = pfx->fp_len;
-      clib_memcpy_fast (d, &nh.ip4, 4);
-      d += 4;
-    }
+  if (event == FIBIPFIX_EVENT_REMOVE)
+    vec_add1 (fm->slot_fei[af], ~0);
   else
     {
-      clib_memcpy_fast (d, &pfx->fp_addr.ip6, 16);
-      d += 16;
-      *d++ = pfx->fp_len;
-      clib_memcpy_fast (d, &nh.ip6, 16);
-      d += 16;
+      vec_add1 (fm->slot_fei[af], fei);
+      hash_set (fm->slot_by_fei[af], fei, slot);
     }
-  clib_mem_unaligned (d, u32) = clib_host_to_net_u32 (sw_if_index);
-  d += 4;
-  clib_mem_unaligned (d, u64) = clib_host_to_net_u64 (r->last_ms);
-  d += 8;
-  *d++ = r->event;
-  clib_mem_unaligned (d, u32) = clib_host_to_net_u32 (r->n_events);
-  d += 4;
-  clib_mem_unaligned (d, u16) = clib_host_to_net_u16 (n_paths);
-  d += 2;
-
-  ASSERT (d - ((u8 *) vlib_buffer_get_current (b) + ptd->next_data_offset) ==
-	  fr->data_record_size);
-
-  b->current_length += fr->data_record_size;
-  ptd->next_data_offset += fr->data_record_size;
-  ptd->n_data_records++;
-  fm->n_records_sent++;
 }
 
+/* send whatever is in the open packets */
 static void
 fibipfix_flush (vlib_main_t *vm)
 {
-  fibipfix_main_t *fm = &fibipfix_main;
   ipfix_exporter_t *exp = fibipfix_exporter ();
-  int have_collector = fibipfix_have_collector (exp);
-  fibipfix_record_t *r;
   flow_report_t *fr;
-  u32 *ri, af;
-
-  fm->n_flushes++;
-
-  vec_foreach (ri, fm->fifo)
-    {
-      r = pool_elt_at_index (fm->records, *ri);
-      if (r->event != FIBIPFIX_EVENT_DEAD)
-	{
-	  if (have_collector)
-	    fibipfix_put_record (vm, exp, r);
-	  else
-	    fm->n_dropped_no_collector++;
-	}
-      if (r->hashed)
-	hash_unset (fm->pending_by_fei, r->fei);
-      pool_put (fm->records, r);
-    }
-  vec_reset_length (fm->fifo);
-  fm->flush_signalled = 0;
-
-  if (!have_collector)
-    return;
+  u32 af;
 
   for (af = 0; af < FIBIPFIX_N_AF; af++)
     {
       fr = fibipfix_find_report (exp, af);
       if (fr)
-	fibipfix_send (vm, exp, fr);
-    }
-}
-
-static fibipfix_record_t *
-fibipfix_record_new (vlib_main_t *vm, fib_node_index_t fei, u8 event)
-{
-  fibipfix_main_t *fm = &fibipfix_main;
-  fibipfix_record_t *r;
-
-  pool_get_zero (fm->records, r);
-  r->fei = fei;
-  r->event = event;
-  r->n_events = 1;
-  r->last_ms = fibipfix_now_ms (vm);
-  vec_add1 (fm->fifo, r - fm->records);
-  return r;
-}
-
-static void
-fibipfix_snapshot_for_remove (fibipfix_record_t *r)
-{
-  const fib_prefix_t *pfx = fib_entry_get_prefix (r->fei);
-
-  r->prefix = *pfx;
-  r->table_id = fib_table_get_table_id (fib_entry_get_fib_index (r->fei),
-					pfx->fp_proto);
-}
-
-static void
-fibipfix_maybe_signal (vlib_main_t *vm)
-{
-  fibipfix_main_t *fm = &fibipfix_main;
-
-  if (!fm->flush_signalled && vec_len (fm->fifo) >= fm->threshold)
-    {
-      fm->flush_signalled = 1;
-      vlib_process_signal_event (vm, fm->process_node_index,
-				 FIBIPFIX_PROCESS_EVENT_FLUSH, 0);
+	fibipfix_send (vm, exp, fr, af);
+      else
+	fibipfix_packet_closed (af);
     }
 }
 
@@ -521,87 +572,22 @@ static void
 fibipfix_install_notify (fib_node_index_t fei, fib_entry_install_event_t ev)
 {
   fibipfix_main_t *fm = &fibipfix_main;
-  vlib_main_t *vm = vlib_get_main ();
-  fibipfix_record_t *r;
-  uword *p;
+  static const u8 map[] = {
+    [FIB_ENTRY_INSTALL_EVENT_ADD] = FIBIPFIX_EVENT_ADD,
+    [FIB_ENTRY_INSTALL_EVENT_UPDATE] = FIBIPFIX_EVENT_UPDATE,
+    [FIB_ENTRY_INSTALL_EVENT_REMOVE] = FIBIPFIX_EVENT_REMOVE,
+  };
 
   fm->n_events++;
-  p = hash_get (fm->pending_by_fei, fei);
-
-  if (!p)
-    {
-      switch (ev)
-	{
-	case FIB_ENTRY_INSTALL_EVENT_ADD:
-	  r = fibipfix_record_new (vm, fei, FIBIPFIX_EVENT_ADD);
-	  break;
-	case FIB_ENTRY_INSTALL_EVENT_UPDATE:
-	  r = fibipfix_record_new (vm, fei, FIBIPFIX_EVENT_UPDATE);
-	  break;
-	case FIB_ENTRY_INSTALL_EVENT_REMOVE:
-	default:
-	  r = fibipfix_record_new (vm, fei, FIBIPFIX_EVENT_REMOVE);
-	  fibipfix_snapshot_for_remove (r);
-	  /* not hashed: the index may be reused for another prefix */
-	  fibipfix_maybe_signal (vm);
-	  return;
-	}
-      r->hashed = 1;
-      hash_set (fm->pending_by_fei, fei, r - fm->records);
-      fibipfix_maybe_signal (vm);
-      return;
-    }
-
-  /* coalesce into the pending record */
-  r = pool_elt_at_index (fm->records, p[0]);
-  r->n_events++;
-  r->last_ms = fibipfix_now_ms (vm);
-  fm->n_coalesced++;
-
-  switch (ev)
-    {
-    case FIB_ENTRY_INSTALL_EVENT_ADD:
-      /* cannot happen without a REMOVE in between (that unhashes), but if it
-       * does the collector still needs an ADD */
-      r->event = FIBIPFIX_EVENT_ADD;
-      break;
-    case FIB_ENTRY_INSTALL_EVENT_UPDATE:
-      if (r->event == FIBIPFIX_EVENT_RESYNC)
-	r->event = FIBIPFIX_EVENT_UPDATE;
-      /* ADD stays ADD: the collector has not seen the entry yet */
-      break;
-    case FIB_ENTRY_INSTALL_EVENT_REMOVE:
-      if (r->event == FIBIPFIX_EVENT_ADD)
-	r->event = FIBIPFIX_EVENT_DEAD;
-      else
-	{
-	  r->event = FIBIPFIX_EVENT_REMOVE;
-	  fibipfix_snapshot_for_remove (r);
-	}
-      hash_unset (fm->pending_by_fei, fei);
-      r->hashed = 0;
-      break;
-    }
+  fibipfix_event (vlib_get_main (), fei, map[ev]);
 }
 
 static fib_table_walk_rc_t
 fibipfix_resync_walk (fib_node_index_t fei, void *ctx)
 {
-  fibipfix_main_t *fm = &fibipfix_main;
-  vlib_main_t *vm = ctx;
-  fibipfix_record_t *r;
-
   /* only entries that are programmed */
-  if (!dpo_id_is_valid (&fib_entry_get (fei)->fe_lb))
-    return FIB_TABLE_WALK_CONTINUE;
-
-  /* already pending: it will be sent with its current state anyway */
-  if (hash_get (fm->pending_by_fei, fei))
-    return FIB_TABLE_WALK_CONTINUE;
-
-  r = fibipfix_record_new (vm, fei, FIBIPFIX_EVENT_RESYNC);
-  r->hashed = 1;
-  hash_set (fm->pending_by_fei, fei, r - fm->records);
+  if (dpo_id_is_valid (&fib_entry_get (fei)->fe_lb))
+    fibipfix_event (ctx, fei, FIBIPFIX_EVENT_RESYNC);
   return FIB_TABLE_WALK_CONTINUE;
 }
 
@@ -616,8 +602,6 @@ fibipfix_resync (vlib_main_t *vm)
   pool_foreach (fib_table, ip6_main.fibs)
     fib_table_walk (fib_table->ft_index, FIB_PROTOCOL_IP6,
 		    fibipfix_resync_walk, vm);
-
-  fibipfix_maybe_signal (vm);
 }
 
 static uword
@@ -636,8 +620,11 @@ fibipfix_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *f)
       vlib_process_get_events (vm, &event_data);
       vec_reset_length (event_data);
 
-      if (fm->enabled && vec_len (fm->fifo))
-	fibipfix_flush (vm);
+      if (fm->enabled)
+	{
+	  fm->n_timer_sends++;
+	  fibipfix_flush (vm);
+	}
     }
   return 0;
 }
@@ -672,14 +659,16 @@ fibipfix_report_add_del (fibipfix_af_t af, int is_add)
 }
 
 static void
-fibipfix_free_pending (void)
+fibipfix_free_state (void)
 {
   fibipfix_main_t *fm = &fibipfix_main;
+  u32 af;
 
-  pool_free (fm->records);
-  hash_free (fm->pending_by_fei);
-  vec_free (fm->fifo);
-  fm->flush_signalled = 0;
+  for (af = 0; af < FIBIPFIX_N_AF; af++)
+    {
+      hash_free (fm->slot_by_fei[af]);
+      vec_free (fm->slot_fei[af]);
+    }
 }
 
 static clib_error_t *
@@ -704,7 +693,8 @@ fibipfix_enable_disable (vlib_main_t *vm, int enable)
 	      return flow_report_add_del_error_to_clib_error (rv);
 	    }
 	}
-      fm->pending_by_fei = hash_create (0, sizeof (uword));
+      for (af = 0; af < FIBIPFIX_N_AF; af++)
+	fm->slot_by_fei[af] = hash_create (0, sizeof (uword));
       fm->vlib_time_0 = vlib_time_now (vm);
       fm->unix_ms_0 = unix_time_now_nsec () / 1000000;
       fib_entry_install_notify_register (fibipfix_install_notify);
@@ -719,7 +709,7 @@ fibipfix_enable_disable (vlib_main_t *vm, int enable)
       fibipfix_flush (vm);
       for (af = 0; af < FIBIPFIX_N_AF; af++)
 	fibipfix_report_add_del (af, 0);
-      fibipfix_free_pending ();
+      fibipfix_free_state ();
       fm->enabled = 0;
     }
   return 0;
@@ -730,7 +720,7 @@ fibipfix_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			    vlib_cli_command_t *cmd)
 {
   fibipfix_main_t *fm = &fibipfix_main;
-  u32 interval_ms = ~0, threshold = ~0, pen = ~0, domain = ~0, port = ~0;
+  u32 interval_ms = ~0, pen = ~0, domain = ~0, port = ~0;
   int disable = 0;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
@@ -738,8 +728,6 @@ fibipfix_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (unformat (input, "disable"))
 	disable = 1;
       else if (unformat (input, "interval %u", &interval_ms))
-	;
-      else if (unformat (input, "threshold %u", &threshold))
 	;
       else if (unformat (input, "enterprise %u", &pen))
 	;
@@ -765,12 +753,6 @@ fibipfix_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	return clib_error_return (0, "interval must be > 0 ms");
       fm->interval = interval_ms * 1e-3;
     }
-  if (threshold != ~0)
-    {
-      if (threshold == 0)
-	return clib_error_return (0, "threshold must be > 0");
-      fm->threshold = threshold;
-    }
   if (pen != ~0)
     fm->enterprise = pen;
   if (domain != ~0)
@@ -787,16 +769,17 @@ fibipfix_enable_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
 /*?
  * Export FIB entry install/update/remove events to the IPFIX collector set
- * with 'set ipfix exporter'. Events on one entry between two flushes are
- * coalesced into one record carrying the latest state.
+ * with 'set ipfix exporter'. Events on an entry that already has a record in
+ * the open packet overwrite that record; the open packet is sent when full
+ * or every interval.
  *
  * @cliexpar
- * @cliexcmd{fib ipfix enable interval 100 threshold 1000}
+ * @cliexcmd{fib ipfix enable interval 100}
  * @cliexcmd{fib ipfix enable disable}
 ?*/
 VLIB_CLI_COMMAND (fibipfix_enable_command, static) = {
   .path = "fib ipfix enable",
-  .short_help = "fib ipfix enable [interval <ms>] [threshold <n>] "
+  .short_help = "fib ipfix enable [interval <ms>] "
 		"[enterprise <pen>] [domain <id>] [src-port <port>] [disable]",
   .function = fibipfix_enable_command_fn,
 };
@@ -842,9 +825,9 @@ fibipfix_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   vlib_cli_output (vm, "fib ipfix: %s", fm->enabled ? "enabled" : "disabled");
   vlib_cli_output (vm,
-		   "  interval %.0f ms, threshold %u, enterprise %u, "
+		   "  interval %.0f ms, enterprise %u, "
 		   "domain %u, src-port %u",
-		   fm->interval * 1e3, fm->threshold, fm->enterprise,
+		   fm->interval * 1e3, fm->enterprise,
 		   fm->domain_id, fm->src_port);
   vlib_cli_output (vm, "  collector: %U -> %U%s", format_ip_address,
 		   &exp->src_address, format_ip_address, &exp->ipfix_collector,
@@ -853,12 +836,16 @@ fibipfix_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
     vlib_cli_output (vm, "  template ids: ip4 %u, ip6 %u",
 		     fm->template_id[FIBIPFIX_AF_IP4],
 		     fm->template_id[FIBIPFIX_AF_IP6]);
-  vlib_cli_output (vm, "  pending: %u records (%u hashed)",
-		   vec_len (fm->fifo), hash_elts (fm->pending_by_fei));
-  vlib_cli_output (vm, "  events %llu, coalesced %llu, flushes %llu",
-		   fm->n_events, fm->n_coalesced, fm->n_flushes);
-  vlib_cli_output (vm, "  records sent %llu, packets sent %llu",
-		   fm->n_records_sent, fm->n_packets_sent);
+  vlib_cli_output (vm, "  open packets: ip4 %u records, ip6 %u records",
+		   vec_len (fm->slot_fei[FIBIPFIX_AF_IP4]),
+		   vec_len (fm->slot_fei[FIBIPFIX_AF_IP6]));
+  vlib_cli_output (vm,
+		   "  events %llu, coalesced %llu, cancelled %llu, "
+		   "timer sends %llu",
+		   fm->n_events, fm->n_coalesced, fm->n_cancelled,
+		   fm->n_timer_sends);
+  vlib_cli_output (vm, "  records written %llu, packets sent %llu",
+		   fm->n_records, fm->n_packets_sent);
   vlib_cli_output (vm,
 		   "  dropped: no collector %llu, no buffer %llu, "
 		   "not ip %llu",
@@ -879,7 +866,6 @@ fibipfix_init (vlib_main_t *vm)
   fibipfix_main_t *fm = &fibipfix_main;
 
   fm->interval = 0.1;
-  fm->threshold = 1000;
   fm->enterprise = FIBIPFIX_DEFAULT_PEN;
   fm->domain_id = 0x46494258; /* "FIBX" */
   fm->src_port = UDP_DST_PORT_ipfix;

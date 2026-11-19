@@ -3,12 +3,12 @@
 A [VPP](https://fd.io/) plugin that exports FIB programming events over IPFIX
 (RFC 7011): every time a FIB entry's forwarding is installed, changed or
 removed, a record goes to the IPFIX collector. Several changes to one entry
-between two sends collapse into one record carrying the latest state and a
-count of the changes.
+while its record is still in the packet being filled collapse into that one
+record, carrying the latest state and a count of the changes.
 
 Status: experimental. Built and tested against VPP master `edae1a0f6`
 (v26.10-rc0-556, 2026-09-23) on Ubuntu 24.04 arm64, debug build. The plugin's 8 tests
-pass. With the core patch applied, VPP's own test_fib, test_ip4, test_ip6, test_mpls, test_flowprobe and test_ipfix_export pass: 150 run, 144 passed, 6 skipped (non-extended run), plugin loaded but not enabled.
+pass (9). With the core patch applied, VPP's own test_fib, test_ip4, test_ip6, test_mpls, test_flowprobe and test_ipfix_export pass: 150 run, 144 passed, 6 skipped (non-extended run), plugin loaded but not enabled.
 
 ## What is here
 
@@ -44,16 +44,17 @@ nothing visible changed. The coalescing below absorbs that.
 
 ## How the plugin works
 
-- **Coalescing.** Pending records are kept per FIB entry. ADD/UPDATE records
-  store only the entry index, and the entry is read when the record is sent,
-  so what is exported is what is programmed at send time. REMOVE takes a
-  snapshot of prefix and table at once (the entry is going away) and is not
-  keyed by index any more, because VPP reuses entry indexes.
-  Merges: ADD+UPDATE = ADD, UPDATE+UPDATE = UPDATE, UPDATE+REMOVE = REMOVE,
-  ADD+REMOVE = nothing sent. Memory is bounded by one live record per prefix.
-- **Sending.** A process node flushes every `interval` (default 100 ms) or when
-  `threshold` records are pending (default 1000), through exporter 0
-  (`set ipfix exporter ...`). One template per address family.
+- **Coalescing window = the open packet.** Each event is written into the
+  open IPFIX packet (one per address family) at once, with the entry's state
+  at that moment. If the entry already has a record in that open packet, the
+  record is overwritten in place and its change count goes up. ADD+UPDATE
+  stays ADD (the collector has not seen it yet); ADD+REMOVE takes the record
+  out of the packet (the last record moves into its slot). Once the packet is
+  sent, the next event for the entry starts a new record in the next packet.
+- **Sending.** The open packet goes out when the next record would not fit
+  (exporter path MTU, or 255 records), and every `interval` (default 100 ms),
+  through exporter 0 (`set ipfix exporter ...`). One template per address
+  family.
 - **Resync.** IPFIX over UDP can lose packets; `fib ipfix resync` queues every
   programmed IPv4/IPv6 entry (event 4).
 
@@ -78,7 +79,7 @@ documentation); set your own with `enterprise <pen>`.
 
 ```
 set ipfix exporter collector 192.0.2.10 src 192.0.2.1 template-interval 20
-fib ipfix enable [interval <ms>] [threshold <n>] [enterprise <pen>] [domain <id>] [src-port <port>]
+fib ipfix enable [interval <ms>] [enterprise <pen>] [domain <id>] [src-port <port>]
 fib ipfix enable disable
 fib ipfix flush
 fib ipfix resync
@@ -99,8 +100,16 @@ make test-debug TEST=test_fibipfix
 `test/test_fibipfix.py` decodes the IPFIX bytes itself (enterprise fields
 included) and checks: templates, ADD with next hop and interface, coalescing
 of three changes into one record with the final state, ADD+REMOVE sending
-nothing, REMOVE, IPv6 in a non-default table, resync, and that IPFIX sequence
-numbers count data records across packets.
+nothing, a change after the packet was sent giving a new record (while a
+route still in the open packet stays one record), REMOVE, IPv6 in a
+non-default table, resync, and that IPFIX sequence numbers count data records
+across packets with no prefix twice in one packet.
+
+Seen in that last test: adding 100 routes via the same next hop gives 100 ADD
+and 42 UPDATE records. The UPDATEs come when the shared path-list reaches 64
+children (`FIB_PATH_LIST_POPULAR` in fib_path_list.c) and VPP re-stacks every
+child's forwarding; the routes whose ADD had already been sent get a new
+record. That is real re-programming, reported as the design intends.
 
 ## Limits / ideas
 

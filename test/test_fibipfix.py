@@ -137,8 +137,8 @@ class TestFibIpfix(VppTestCase):
 
     def setUp(self):
         super(TestFibIpfix, self).setUp()
-        # a long interval: the tests flush by hand
-        self.vapi.cli("fib ipfix enable interval 1000000 threshold 1000000")
+        # a long interval: the tests flush by hand, or fill a packet
+        self.vapi.cli("fib ipfix enable interval 1000000")
         self.templates = {}
 
     def tearDown(self):
@@ -148,11 +148,10 @@ class TestFibIpfix(VppTestCase):
     def collect(self, timeout=3):
         """Flush and return (records, messages) seen on the collector.
 
+        The capture must already be armed (arm(), or the previous collect).
         Templates arrive every second (template_interval 1), so stop on an
         absolute deadline, not on a quiet gap: the capture is never quiet.
         """
-        self.pg_enable_capture([self.pg0])
-        self.pg_start()
         self.vapi.cli("fib ipfix flush")
         messages = []
         deadline = time.time() + timeout
@@ -172,10 +171,19 @@ class TestFibIpfix(VppTestCase):
                 # the flush sends everything at once: settle briefly, then stop
                 deadline = min(deadline, time.time() + 1.0)
         records = [decode_record(r) for m in messages for (_, r) in m.records]
+        # arm for the next step: a full packet can go out while the test is
+        # still changing routes, before the next collect
+        self.arm()
         return records, messages
+
+    def arm(self):
+        """Start a fresh capture on the collector interface"""
+        self.pg_enable_capture([self.pg0])
+        self.pg_start()
 
     def wait_templates(self):
         """Templates come from the exporter process (template_interval 1 s)"""
+        self.arm()
         for _ in range(5):
             self.collect(timeout=2)
             if len(self.templates) >= 2:
@@ -249,6 +257,38 @@ class TestFibIpfix(VppTestCase):
         route.remove_vpp_config()
         records, _ = self.collect()
         self.assertEqual(self.for_prefix(records, "10.30.0.0/16"), [], records)
+
+    def test_coalesce_only_within_open_packet(self):
+        """Once a packet is sent, a new change gives a new record"""
+        self.wait_templates()
+        # 1450 B MTU, 48 B of headers, 32 B per v4 record: 43 fit in a packet
+        routes = [
+            VppIpRoute(
+                self,
+                "10.70.%d.0" % i,
+                24,
+                [VppRoutePath(self.pg1.remote_ip4, 0xFFFFFFFF)],
+            )
+            for i in range(60)
+        ]
+        for r in routes:
+            r.add_vpp_config()  # route 0 is in the first packet, which goes out
+        routes[0].modify([VppRoutePath(self.pg2.remote_ip4, 0xFFFFFFFF)])
+        routes[59].modify([VppRoutePath(self.pg2.remote_ip4, 0xFFFFFFFF)])
+        records, _ = self.collect()
+        first = self.for_prefix(records, "10.70.0.0/24")
+        last = self.for_prefix(records, "10.70.59.0/24")
+        # route 0: ADD in packet 1, then a new UPDATE record in packet 2
+        self.assertEqual([r["event"] for r in first], [EV_ADD, EV_UPDATE], first)
+        self.assertEqual(first[0]["nh"], ip_address(self.pg1.remote_ip4))
+        self.assertEqual(first[1]["nh"], ip_address(self.pg2.remote_ip4))
+        # route 59 was still in the open packet: one record, last state
+        self.assertEqual(len(last), 1, last)
+        self.assertEqual(last[0]["event"], EV_ADD)
+        self.assertEqual(last[0]["nh"], ip_address(self.pg2.remote_ip4))
+        self.assertGreaterEqual(last[0]["count"], 2)
+        for r in routes:
+            r.remove_vpp_config()
 
     def test_remove(self):
         """A removed route is exported as REMOVE with its prefix"""
@@ -325,9 +365,20 @@ class TestFibIpfix(VppTestCase):
         for a, b in zip(data_msgs, data_msgs[1:]):
             if a.domain == b.domain:
                 self.assertEqual(b.seq - a.seq, len(a.records))
-        self.assertEqual(
-            len([r for r in records if str(r["prefix"]).startswith("10.60.")]), 100
+        mine = [r for r in records if str(r["prefix"]).startswith("10.60.")]
+        self.logger.info(
+            "10.60 records by event: %s"
+            % {e: len([r for r in mine if r["event"] == e]) for e in (1, 2, 3, 4)}
         )
+        # every route exported, each with exactly one ADD
+        self.assertEqual(len({r["prefix"] for r in mine}), 100)
+        adds = [r["prefix"] for r in mine if r["event"] == EV_ADD]
+        self.assertEqual(len(adds), 100, mine)
+        self.assertEqual(len(set(adds)), 100)
+        # coalescing: a prefix never has two records in one packet
+        for m in data_msgs:
+            pfx = [decode_record(r)["prefix"] for (_, r) in m.records]
+            self.assertEqual(len(pfx), len(set(pfx)))
         for r in routes:
             r.remove_vpp_config()
 
